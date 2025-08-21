@@ -332,6 +332,62 @@ function histogramBins(points, binSize = HIST_BIN_SIZE) {
   return bins;
 }
 
+// ---------- Bulk mapping helpers (areas <-> biomarkers) ----------
+const BIOMARKER_CANON = new Map(BIOMARKERS.map((b) => [norm(b), b]));
+function canonicalizeBiomarker(name) {
+  return BIOMARKER_CANON.get(norm(name)) || null;
+}
+
+// Parse pasted text containing pairs of "AREA<TAB or ,>BIOMARKER"
+function parseAreaBiomarkerText(text) {
+  const out = [];
+  const lines = String(text || "").split("\n");
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let a = null, b = null;
+    if (line.includes("\t")) {
+      const parts = line.split("\t");
+      if (parts.length >= 2) { a = parts[0]; b = parts.slice(1).join("\t"); }
+    } else if (line.includes(",")) {
+      const parts = line.split(",");
+      if (parts.length >= 2) { a = parts[0]; b = parts.slice(1).join(","); }
+    } else {
+      const idx = line.indexOf("  "); // at least two spaces
+      if (idx >= 0) { a = line.slice(0, idx); b = line.slice(idx).trimStart(); }
+    }
+    if (a !== null && b !== null) out.push([a.trim(), b.trim()]);
+  }
+  return out;
+}
+
+// Pure function: apply pairs to an areas array; returns { areas, unknowns, createdAreas, addedLinks }
+function applyPairsPure(prevAreas, pairs) {
+  const areas = prevAreas.map((a) => ({ ...a, biomarkers: new Set(a.biomarkers) }));
+  const indexByNorm = new Map(areas.map((a, i) => [norm(a.name), i]));
+  const unknowns = new Set();
+  let createdAreas = 0, addedLinks = 0;
+
+  function ensureArea(areaName) {
+    const key = norm(areaName);
+    if (indexByNorm.has(key)) return areas[indexByNorm.get(key)];
+    const newArea = { id: uid(), name: areaName.trim(), biomarkers: new Set() };
+    areas.push(newArea);
+    indexByNorm.set(key, areas.length - 1);
+    createdAreas += 1;
+    return newArea;
+  }
+
+  for (const [areaName, biomarkerInput] of pairs) {
+    const canon = canonicalizeBiomarker(biomarkerInput);
+    if (!canon) { unknowns.add(biomarkerInput); continue; }
+    const area = ensureArea(areaName);
+    if (!area.biomarkers.has(canon)) { area.biomarkers.add(canon); addedLinks += 1; }
+  }
+
+  return { areas, unknowns, createdAreas, addedLinks };
+}
+
 // -------- Self-tests (lightweight) --------
 function runSelfTests() {
   const tests = [];
@@ -451,6 +507,31 @@ function runSelfTests() {
   });
   t("scoreBandColor uses gray for null", () => scoreBandColor(null) === "#9ca3af");
 
+  t("parseAreaBiomarkerText parses tab and comma", () => {
+    const txt = `Area A\tGlucose\nArea B,Alanine\nArea C    Glycine`;
+    const pairs = parseAreaBiomarkerText(txt);
+    return pairs.length === 3 && pairs[0][1] === "Glucose" && pairs[1][1] === "Alanine" && pairs[2][0] === "Area C";
+  });
+
+  t("canonicalizeBiomarker is case-insensitive", () => {
+    return canonicalizeBiomarker("glucose") === "Glucose" && canonicalizeBiomarker("GLUCOSE") === "Glucose";
+  });
+
+  t("applyPairsPure creates areas and links biomarkers", () => {
+    const prev = [];
+    const { areas, unknowns, createdAreas, addedLinks } =
+      applyPairsPure(prev, [["Urea cycle", "Glutamine"], ["Urea cycle", "Ornithine"], ["Unknown Area", "NotARealMarker"]]);
+    const urea = areas.find(a => a.name === "Urea cycle");
+    return createdAreas >= 1 && addedLinks === 2 && unknowns.size === 1 && urea && urea.biomarkers.has("Glutamine");
+  });
+
+  t("applyPairsPure merges case-insensitive area names", () => {
+    const prev = [{ id: "x", name: "Glycolysis–Gluconeogenesis", biomarkers: new Set() }];
+    const res = applyPairsPure(prev, [["glycolysis–gluconeogenesis", "Glucose"]]);
+    const area = res.areas.find(a => a.name === "Glycolysis–Gluconeogenesis");
+    return area && area.biomarkers.has("Glucose");
+  });
+
   return tests;
 }
 
@@ -462,6 +543,8 @@ export default function App() {
 
   const [csvRows, setCsvRows] = useState([]);
   const [csvMeta, setCsvMeta] = useState();
+  const [bulkText, setBulkText] = useState("");
+  const [mappingMeta, setMappingMeta] = useState(null);
 
   const activeArea = useMemo(
     () => areas.find((a) => a.id === activeAreaId) || null,
@@ -545,6 +628,35 @@ export default function App() {
     });
   }
 
+  function applyMappingPairs(pairs) {
+    if (!Array.isArray(pairs) || pairs.length === 0) return;
+    setAreas((prev) => {
+      const { areas: nextAreas, unknowns, createdAreas, addedLinks } = applyPairsPure(prev, pairs);
+      setMappingMeta({ unknowns: Array.from(unknowns), createdAreas, addedLinks });
+      return nextAreas;
+    });
+  }
+
+  function handleMappingUpload(file) {
+    if (!file) return;
+    Papa.parse(file, {
+      header: false,
+      dynamicTyping: false,
+      skipEmptyLines: true,
+      complete: ({ data }) => {
+        const pairs = (data || [])
+          .map((row) => [String(row[0] ?? "").trim(), String(row[1] ?? "").trim()])
+          .filter(([a, b]) => a && b);
+        applyMappingPairs(pairs);
+      },
+    });
+  }
+
+  function applyMappingFromText() {
+    const pairs = parseAreaBiomarkerText(bulkText);
+    applyMappingPairs(pairs);
+  }
+
   const selfTests = useMemo(() => runSelfTests(), []);
 
   return (
@@ -558,13 +670,19 @@ export default function App() {
 
           {/* CSV uploader */}
           <div className="mt-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
-            <label className="text-sm font-medium">Upload biomarker CSV</label>
             <input
+              id="csvInput"
               type="file"
               accept=".csv,text/csv"
               onChange={(e) => handleCsvUpload(e.target.files?.[0] || null)}
-              className="block w-full sm:w-auto text-sm"
+              className="hidden"
             />
+            <label
+              htmlFor="csvInput"
+              className="inline-flex w-full sm:w-auto items-center justify-center rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700 cursor-pointer"
+            >
+              Upload biomarker CSV
+            </label>
             {csvMeta?.loaded && <span className="text-xs text-gray-600">Loaded {csvMeta.rowCount} rows</span>}
             {csvMeta?.error && <span className="text-xs text-red-600">{csvMeta.error}</span>}
           </div>
@@ -593,6 +711,36 @@ export default function App() {
           >
             Add
           </button>
+        </div>
+
+        {/* Bulk add via CSV or paste */}
+        <div className="mb-6 rounded-2xl border bg-white p-4 shadow-sm">
+          <h2 className="text-lg font-medium mb-2">Bulk add areas & biomarkers</h2>
+          <p className="text-sm text-gray-600 mb-3">Upload a two-column CSV (AREA, BIOMARKER) or paste text with a <strong>tab</strong> or <strong>comma</strong> between columns. Biomarker names must match the predefined list (case-insensitive).</p>
+          <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-end">
+            <div className="flex-1">
+              <label className="block text-sm font-medium mb-1" htmlFor="bulkText">Paste pairs</label>
+              <textarea id="bulkText" value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="Health Area	Biomarker" className="w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 h-28"></textarea>
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => applyMappingFromText()} className="rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700">Apply pasted pairs</button>
+              <div>
+                <input id="mapCsvInput" type="file" accept=".csv,text/csv" onChange={(e) => handleMappingUpload(e.target.files?.[0] || null)} className="hidden" />
+                <label htmlFor="mapCsvInput" className="inline-flex items-center justify-center rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700 cursor-pointer">Upload mapping CSV</label>
+              </div>
+            </div>
+          </div>
+          {mappingMeta && (
+            <p className="mt-2 text-xs text-gray-600">Added <strong>{mappingMeta.addedLinks}</strong> biomarker links across <strong>{mappingMeta.createdAreas}</strong> new areas. {mappingMeta.unknowns?.length ? `Skipped ${mappingMeta.unknowns.length} unknown biomarker(s).` : ""}</p>
+          )}
+          {mappingMeta?.unknowns?.length ? (
+            <details className="mt-1">
+              <summary className="text-xs text-gray-600 cursor-pointer">Show unknown biomarkers</summary>
+              <ul className="text-xs list-disc pl-6">
+                {mappingMeta.unknowns.slice(0, 50).map((u, i) => (<li key={`unk-${i}`}>{u}</li>))}
+              </ul>
+            </details>
+          ) : null}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
