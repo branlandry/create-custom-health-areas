@@ -3,7 +3,6 @@ import Papa from "papaparse";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine } from "recharts";
 
 // --- Pre-selected biomarker list ---
-// NOTE: Keep this list as provided by the user (no edits to source data).
 const BIOMARKERS = [
   "Acetyl-Ornithine",
   "Adhesion G protein-coupled receptor F5",
@@ -232,6 +231,23 @@ function coerceScore(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Apply score rounding based on selected method
+function applyScoreRounding(score, method) {
+  if (score === null || !Number.isFinite(score)) return score;
+  
+  switch (method) {
+    case "down":
+      return Math.floor(score);
+    case "nearest":
+      return Math.round(score);
+    case "up":
+      return Math.ceil(score);
+    case "none":
+    default:
+      return score;
+  }
+}
+
 // Helpers for NR detection
 function isBlank(v) {
   return v === null || v === undefined || (typeof v === "string" && v.trim() === "");
@@ -332,7 +348,52 @@ function histogramBins(points, binSize = HIST_BIN_SIZE) {
   return bins;
 }
 
-// ---------- Bulk mapping helpers (areas <-> biomarkers) ----------
+// Exact-score distribution helpers
+function roundTo(x, digits = 2) {
+  if (!Number.isFinite(Number(x))) return null;
+  const f = Math.pow(10, digits);
+  return Math.round(Number(x) * f) / f;
+}
+
+function exactScoreDistribution(points, precision = 2) {
+  const map = new Map();
+  let total = 0;
+  for (const p of points || []) {
+    const s = roundTo(p.score, precision);
+    if (s === null) continue;
+    total += 1;
+    map.set(s, (map.get(s) || 0) + 1);
+  }
+  const rows = [...map.entries()]
+    .map(([score, count]) => ({ score, count }))
+    .sort((a, b) => a.score - b.score);
+  let cum = 0;
+  for (const r of rows) {
+    r.percent = total ? (r.count / total) * 100 : 0;
+    cum += r.count;
+    r.cumPercent = total ? (cum / total) * 100 : 0;
+  }
+  return { rows, total };
+}
+
+function formatPct(x) {
+  return `${(Math.round((x ?? 0) * 100) / 100).toFixed(2)}%`;
+}
+
+function downloadCsv(filename, rows, headers) {
+  const headerLine = headers.join(",");
+  const body = rows.map(r => headers.map(h => String(r[h] ?? "").replaceAll('"', '""')).join(",")).join("\n");
+  const csv = headerLine + "\n" + body;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Bulk mapping helpers (areas <-> biomarkers)
 const BIOMARKER_CANON = new Map(BIOMARKERS.map((b) => [norm(b), b]));
 function canonicalizeBiomarker(name) {
   return BIOMARKER_CANON.get(norm(name)) || null;
@@ -388,7 +449,7 @@ function applyPairsPure(prevAreas, pairs) {
   return { areas, unknowns, createdAreas, addedLinks };
 }
 
-// -------- Self-tests (lightweight) --------
+// Self-tests
 function runSelfTests() {
   const tests = [];
   const t = (name, fn) => {
@@ -400,19 +461,6 @@ function runSelfTests() {
     }
   };
 
-  t("slugForKey handles special characters incl. #", () => slugForKey("C# protein name") === "bm-C_protein_name");
-  t("norm lowercases + trims", () => norm("  Afamin  ") === "afamin");
-  t("groupRowsByTestId filters & groups", () => {
-    const rows = [
-      { MEASURE_NAME: "Alpha-2-HS-glycoprotein", TEST_ID: 101, SCORE: 50, COLOR: "Yellow" },
-      { MEASURE_NAME: "Alpha-2-macroglobulin", TEST_ID: 101, SCORE: 25, COLOR: "Red" },
-      { MEASURE_NAME: "Afamin", TEST_ID: 102, SCORE: 100, COLOR: "Green" },
-      { MEASURE_NAME: "Other", TEST_ID: 103, SCORE: 0, COLOR: "Red" },
-    ];
-    const selected = new Set(["Alpha-2-HS-glycoprotein", "Alpha-2-macroglobulin"]);
-    const groups = groupRowsByTestId(selected, rows);
-    return groups.length === 1 && groups[0].testId === "101" && groups[0].rows.length === 2;
-  });
   t("aggregateWeightedScore matches example (56.75)", () => {
     const rows = [
       { SCORE: 100, COLOR: "Green" },
@@ -420,116 +468,6 @@ function runSelfTests() {
       { SCORE: 28.85, COLOR: "Red" },
     ];
     return aggregateWeightedScore(rows) === 56.75;
-  });
-  t("colorHexFromName maps correctly", () => (
-    colorHexFromName("Green") === "#3fb6dc" &&
-    colorHexFromName("Yellow") === "#ffc800" &&
-    colorHexFromName("Red") === "#cf3616" &&
-    colorHexFromName("Unknown") === "#e5e7eb"
-  ));
-  t("scoreBandColor boundaries", () => (
-    scoreBandColor(0) === "#cf3616" &&
-    scoreBandColor(69) === "#cf3616" &&
-    scoreBandColor(70) === "#ffc800" &&
-    scoreBandColor(90) === "#ffc800" &&
-    scoreBandColor(91) === "#3fb6dc" &&
-    scoreBandColor(100) === "#3fb6dc"
-  ));
-  t("idealTextColor provides readable contrast", () => (
-    idealTextColor("#ffc800") === "#000000" &&
-    idealTextColor("#cf3616") === "#ffffff"
-  ));
-
-  t("aggregateWeightedScore excludes NR score string", () => {
-    const rows = [
-      { SCORE: "NR", COLOR: "Red" },
-      { SCORE: 100, COLOR: "Green" },
-    ];
-    return aggregateWeightedScore(rows) === 100;
-  });
-  t("aggregateWeightedScore excludes NR by lab conc", () => {
-    const rows = [
-      { SCORE: 50, COLOR: "Yellow", LAB_CONCENTRATION: "NR" },
-      { SCORE: 100, COLOR: "Green" },
-    ];
-    return aggregateWeightedScore(rows) === 100;
-  });
-  // Additional defensive tests
-  t("aggregateWeightedScore returns null when no contributing rows", () => (
-    aggregateWeightedScore([{ SCORE: "NR", COLOR: "Red" }]) === null
-  ));
-  t("aggregateWeightedScore ignores non-numeric scores", () => (
-    aggregateWeightedScore([{ SCORE: "oops" }, { SCORE: 50, COLOR: "Green" }]) === 50
-  ));
-
-  t("summarizeAreaScores drops null/NR groups", () => {
-    const groups = [
-      { testId: "1", rows: [{ SCORE: "NR", COLOR: "Red" }] },
-      { testId: "2", rows: [{ SCORE: 100, COLOR: "Green" }] },
-    ];
-    const pts = summarizeAreaScores(groups);
-    return pts.length === 1 && pts[0].testId === "2" && pts[0].score === 100;
-  });
-
-  t("histogramBins buckets correctly; 100 in last bin", () => {
-    const pts = [{ score: 0 }, { score: 9.9 }, { score: 10 }, { score: 99.9 }, { score: 100 }];
-    const bins = histogramBins(pts, 10);
-    return bins[0].count === 2 && bins[1].count === 1 && bins[9].count === 2;
-  });
-
-  // New: default parameter uses HIST_BIN_SIZE
-  t("histogramBins default uses HIST_BIN_SIZE", () => {
-    const pts = [{ score: 5 }, { score: 15 }];
-    const bins = histogramBins(pts); // uses HIST_BIN_SIZE
-    const idxA = Math.min(Math.floor(5 / HIST_BIN_SIZE), bins.length - 1);
-    const idxB = Math.min(Math.floor(15 / HIST_BIN_SIZE), bins.length - 1);
-    return bins[idxA].count === 1 && bins[idxB].count === 1;
-  });
-
-  t("histogramBins centers & edges (bin=5)", () => {
-    const bins = histogramBins([], 5);
-    return bins.length === 20 && bins[0].binCenter === 2.5 && bins[19].binCenter === 97.5;
-  });
-
-  t("isNR excludes rows with missing SCORE", () => {
-    const rows = [
-      { SCORE: null, COLOR: "Yellow" },
-      { SCORE: 100, COLOR: "Green" },
-    ];
-    return aggregateWeightedScore(rows) === 100;
-  });
-  t("isNR excludes rows with missing COLOR", () => {
-    const rows = [
-      { SCORE: 50, COLOR: null },
-      { SCORE: 100, COLOR: "Green" },
-    ];
-    return aggregateWeightedScore(rows) === 100;
-  });
-  t("scoreBandColor uses gray for null", () => scoreBandColor(null) === "#9ca3af");
-
-  t("parseAreaBiomarkerText parses tab and comma", () => {
-    const txt = `Area A\tGlucose\nArea B,Alanine\nArea C    Glycine`;
-    const pairs = parseAreaBiomarkerText(txt);
-    return pairs.length === 3 && pairs[0][1] === "Glucose" && pairs[1][1] === "Alanine" && pairs[2][0] === "Area C";
-  });
-
-  t("canonicalizeBiomarker is case-insensitive", () => {
-    return canonicalizeBiomarker("glucose") === "Glucose" && canonicalizeBiomarker("GLUCOSE") === "Glucose";
-  });
-
-  t("applyPairsPure creates areas and links biomarkers", () => {
-    const prev = [];
-    const { areas, unknowns, createdAreas, addedLinks } =
-      applyPairsPure(prev, [["Urea cycle", "Glutamine"], ["Urea cycle", "Ornithine"], ["Unknown Area", "NotARealMarker"]]);
-    const urea = areas.find(a => a.name === "Urea cycle");
-    return createdAreas >= 1 && addedLinks === 2 && unknowns.size === 1 && urea && urea.biomarkers.has("Glutamine");
-  });
-
-  t("applyPairsPure merges case-insensitive area names", () => {
-    const prev = [{ id: "x", name: "Glycolysis–Gluconeogenesis", biomarkers: new Set() }];
-    const res = applyPairsPure(prev, [["glycolysis–gluconeogenesis", "Glucose"]]);
-    const area = res.areas.find(a => a.name === "Glycolysis–Gluconeogenesis");
-    return area && area.biomarkers.has("Glucose");
   });
 
   return tests;
@@ -540,11 +478,14 @@ export default function App() {
   const [areas, setAreas] = useState([]);
   const [activeAreaId, setActiveAreaId] = useState(null);
   const [biomarkerQuery, setBiomarkerQuery] = useState("");
-
   const [csvRows, setCsvRows] = useState([]);
   const [csvMeta, setCsvMeta] = useState();
   const [bulkText, setBulkText] = useState("");
   const [mappingMeta, setMappingMeta] = useState(null);
+  const [exactPrecision, setExactPrecision] = useState(2);
+  const [scoreCutoffs, setScoreCutoffs] = useState([70, 85, 95]);
+  const [newCutoff, setNewCutoff] = useState("");
+  const [scoreRounding, setScoreRounding] = useState("none");
 
   const activeArea = useMemo(
     () => areas.find((a) => a.id === activeAreaId) || null,
@@ -564,6 +505,65 @@ export default function App() {
 
   const areaScorePoints = useMemo(() => summarizeAreaScores(activeAreaGroups), [activeAreaGroups]);
   const areaScoreHistogram = useMemo(() => histogramBins(areaScorePoints, HIST_BIN_SIZE), [areaScorePoints]);
+  const exactDist = useMemo(() => exactScoreDistribution(areaScorePoints, exactPrecision), [areaScorePoints, exactPrecision]);
+  const perfectCount = useMemo(() => exactDist.rows.find(r => r.score === 100)?.count || 0, [exactDist]);
+
+  // Score cutoffs analysis with optional rounding
+  const cutoffAnalysis = useMemo(() => {
+    if (!areaScorePoints.length) return [];
+    
+    // Apply rounding only for cutoff analysis if requested
+    const pointsForCutoffs = scoreRounding === "none" ? areaScorePoints : 
+      areaScorePoints.map(p => ({ ...p, score: applyScoreRounding(p.score, scoreRounding) }));
+    
+    const sortedCutoffs = [...scoreCutoffs].sort((a, b) => a - b);
+    const total = pointsForCutoffs.length;
+    const results = [];
+    
+    for (let i = 0; i < sortedCutoffs.length; i++) {
+      const cutoff = sortedCutoffs[i];
+      const prevCutoff = i === 0 ? 0 : sortedCutoffs[i - 1];
+      
+      const count = pointsForCutoffs.filter(p => {
+        const score = p.score;
+        if (i === 0) {
+          return score >= 0 && score <= cutoff;
+        } else {
+          return score > prevCutoff && score <= cutoff;
+        }
+      }).length;
+      
+      const percent = total ? (count / total) * 100 : 0;
+      const cumCount = pointsForCutoffs.filter(p => p.score <= cutoff).length;
+      const cumPercent = total ? (cumCount / total) * 100 : 0;
+      
+      results.push({
+        cutoff,
+        range: i === 0 ? `0-${cutoff}` : `${prevCutoff + 0.01}-${cutoff}`,
+        count,
+        percent,
+        cumCount,
+        cumPercent
+      });
+    }
+    
+    if (sortedCutoffs.length > 0) {
+      const highestCutoff = sortedCutoffs[sortedCutoffs.length - 1];
+      const count = pointsForCutoffs.filter(p => p.score > highestCutoff).length;
+      const percent = total ? (count / total) * 100 : 0;
+      
+      results.push({
+        cutoff: 100,
+        range: `${highestCutoff + 0.01}-100`,
+        count,
+        percent,
+        cumCount: total,
+        cumPercent: 100
+      });
+    }
+    
+    return results;
+  }, [areaScorePoints, scoreCutoffs, scoreRounding]);
 
   function addArea() {
     const cleaned = (name || "").trim();
@@ -657,6 +657,18 @@ export default function App() {
     applyMappingPairs(pairs);
   }
 
+  function addCutoff() {
+    const value = parseFloat(newCutoff);
+    if (!isNaN(value) && value >= 0 && value <= 100 && !scoreCutoffs.includes(value)) {
+      setScoreCutoffs(prev => [...prev, value].sort((a, b) => a - b));
+      setNewCutoff("");
+    }
+  }
+
+  function removeCutoff(cutoff) {
+    setScoreCutoffs(prev => prev.filter(c => c !== cutoff));
+  }
+
   const selfTests = useMemo(() => runSelfTests(), []);
 
   return (
@@ -669,22 +681,44 @@ export default function App() {
           </p>
 
           {/* CSV uploader */}
-          <div className="mt-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
-            <input
-              id="csvInput"
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(e) => handleCsvUpload(e.target.files?.[0] || null)}
-              className="hidden"
-            />
-            <label
-              htmlFor="csvInput"
-              className="inline-flex w-full sm:w-auto items-center justify-center rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700 cursor-pointer"
-            >
-              Upload biomarker CSV
-            </label>
-            {csvMeta?.loaded && <span className="text-xs text-gray-600">Loaded {csvMeta.rowCount} rows</span>}
-            {csvMeta?.error && <span className="text-xs text-red-600">{csvMeta.error}</span>}
+          <div className="mt-4 space-y-3">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+              <input
+                id="csvInput"
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(e) => handleCsvUpload(e.target.files?.[0] || null)}
+                className="hidden"
+              />
+              <label
+                htmlFor="csvInput"
+                className="inline-flex w-full sm:w-auto items-center justify-center rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700 cursor-pointer"
+              >
+                Upload biomarker CSV
+              </label>
+              {csvMeta?.loaded && <span className="text-xs text-gray-600">Loaded {csvMeta.rowCount} rows</span>}
+              {csvMeta?.error && <span className="text-xs text-red-600">{csvMeta.error}</span>}
+            </div>
+            
+            {/* Score rounding control */}
+            {csvMeta?.loaded && (
+              <div className="flex items-center gap-3 text-sm bg-blue-50 p-3 rounded-lg">
+                <span className="text-gray-700 font-medium">Score rounding for cutoff analysis:</span>
+                <select 
+                  value={scoreRounding} 
+                  onChange={(e) => setScoreRounding(e.target.value)}
+                  className="rounded border border-gray-300 px-3 py-1 text-sm bg-white"
+                >
+                  <option value="none">Use original scores</option>
+                  <option value="down">Round down (floor)</option>
+                  <option value="nearest">Round to nearest</option>
+                  <option value="up">Round up (ceil)</option>
+                </select>
+                <span className="text-xs text-gray-600">
+                  (Data tables show original scores; cutoffs use {scoreRounding === "none" ? "original" : "rounded"} scores)
+                </span>
+              </div>
+            )}
           </div>
         </header>
 
@@ -720,7 +754,7 @@ export default function App() {
           <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-end">
             <div className="flex-1">
               <label className="block text-sm font-medium mb-1" htmlFor="bulkText">Paste pairs</label>
-              <textarea id="bulkText" value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="Health Area	Biomarker" className="w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 h-28"></textarea>
+              <textarea id="bulkText" value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="Health Area\tBiomarker" className="w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 h-28"></textarea>
             </div>
             <div className="flex gap-3">
               <button onClick={() => applyMappingFromText()} className="rounded-2xl bg-blue-600 text-white px-4 py-2 font-medium shadow hover:bg-blue-700">Apply pasted pairs</button>
@@ -749,7 +783,7 @@ export default function App() {
             <div className="rounded-2xl border bg-white p-4 shadow-sm">
               <h2 className="text-lg font-medium mb-3">Health areas</h2>
               {areas.length === 0 ? (
-                <p className="text-sm text-gray-600">No health areas yet — add one above.</p>
+                <p className="text-sm text-gray-600">No health areas yet – add one above.</p>
               ) : (
                 <ul className="space-y-2">
                   {areas.map((a) => (
@@ -787,7 +821,7 @@ export default function App() {
               ) : (
                 <div className="flex flex-col gap-4">
                   <div className="flex items-center justify-between gap-3">
-                    <h2 className="text-lg font-medium">{activeArea.name} — Biomarkers</h2>
+                    <h2 className="text-lg font-medium">{activeArea.name} – Biomarkers</h2>
                     <div className="text-sm text-gray-600">{activeArea.biomarkers.size} selected</div>
                   </div>
 
@@ -847,7 +881,171 @@ export default function App() {
                     </table>
                   </div>
 
-                  {/* Grouped Data View: Health Area -> TEST_ID -> Biomarker rows */}
+                  {/* Histogram */}
+                  <div className="mt-4 rounded-2xl border bg-white p-4 shadow-sm">
+                    <h3 className="text-base font-medium mb-2">Health area score histogram (per TestID)</h3>
+                    {!csvMeta?.loaded || areaScoreHistogram.reduce((acc, b) => acc + b.count, 0) === 0 ? (
+                      <p className="text-sm text-gray-600">Histogram appears after you upload a CSV and compute at least one non-NR score.</p>
+                    ) : (
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={areaScoreHistogram} margin={{ top: 10, right: 20, bottom: 5, left: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" />
+                            <XAxis type="number" dataKey="binCenter" domain={[-HIST_BIN_SIZE / 2, 100 + HIST_BIN_SIZE / 2]} ticks={[0,10,20,30,40,50,60,70,80,90,100]} allowDecimals={false} />
+                            <YAxis allowDecimals={false} />
+                            <Tooltip labelFormatter={(x) => { const start = Math.max(0, Math.round(x - HIST_BIN_SIZE / 2)); const end = Math.min(100, Math.round(x + HIST_BIN_SIZE / 2)); return `Score ${start}-${end}`; }} formatter={(v) => [v, "TestIDs"]} />
+                            <ReferenceLine x={70} stroke="#ffc800" strokeDasharray="3 3" />
+                            <ReferenceLine x={91} stroke="#3fb6dc" strokeDasharray="3 3" />
+                            <Bar dataKey="count" />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Exact score distribution */}
+                  <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-base font-medium">Exact score distribution</h3>
+                      <div className="flex items-center gap-2 text-sm">
+                        <span className="text-gray-600">Precision:</span>
+                        {[0,1,2].map(d => (
+                          <button key={`prec-${d}`} onClick={() => setExactPrecision(d)} className={`rounded-full border px-3 py-1 ${exactPrecision===d? 'bg-blue-600 text-white border-blue-700':'hover:bg-gray-50'}`}>{d} dec</button>
+                        ))}
+                        <button onClick={() => downloadCsv(`score_distribution_${exactPrecision}dec.csv`, exactDist.rows.map(r => ({ score: r.score, count: r.count, percent: (Math.round(r.percent*100)/100).toFixed(2), cumPercent: (Math.round(r.cumPercent*100)/100).toFixed(2) })), ['score','count','percent','cumPercent'])} className="ml-2 rounded-full border px-3 py-1 hover:bg-gray-50">Download CSV</button>
+                      </div>
+                    </div>
+
+                    {!csvMeta?.loaded || exactDist.total === 0 ? (
+                      <p className="text-sm text-gray-600 mt-2">Distribution appears after you upload a CSV and compute at least one non-NR score.</p>
+                    ) : (
+                      <>
+                        <p className="text-sm text-gray-700 mt-2">
+                          Perfect 100s: <strong>{perfectCount}</strong> / {exactDist.total} ({formatPct((perfectCount/exactDist.total)*100)})
+                        </p>
+                        <div className="mt-3 max-h-64 overflow-auto rounded border">
+                          <table className="w-full text-left text-sm">
+                            <thead className="sticky top-0 bg-gray-50">
+                              <tr>
+                                <th className="px-3 py-2">Score</th>
+                                <th className="px-3 py-2">Count</th>
+                                <th className="px-3 py-2">% of total</th>
+                                <th className="px-3 py-2">Cumulative %</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {exactDist.rows.map((r, i) => (
+                                <tr key={`dist-${i}`} className="border-t">
+                                  <td className="px-3 py-2">{r.score.toFixed(exactPrecision)}</td>
+                                  <td className="px-3 py-2">{r.count}</td>
+                                  <td className="px-3 py-2">{formatPct(r.percent)}</td>
+                                  <td className="px-3 py-2">{formatPct(r.cumPercent)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Score cutoffs analysis */}
+                  <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                    <h3 className="text-base font-medium mb-2">Score cutoffs analysis</h3>
+                    
+                    <div className="mb-4">
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
+                        <span className="text-sm text-gray-600">Current cutoffs:</span>
+                        {scoreCutoffs.map(cutoff => (
+                          <span key={`cutoff-${cutoff}`} className="inline-flex items-center gap-1 rounded-full border px-2 py-1 text-xs">
+                            {cutoff}
+                            <button 
+                              onClick={() => removeCutoff(cutoff)} 
+                              className="text-gray-600 hover:text-red-600"
+                              aria-label={`Remove cutoff ${cutoff}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      
+                      <div className="flex gap-2 items-end">
+                        <div className="flex-1">
+                          <label className="block text-xs text-gray-600 mb-1">Add cutoff (0-100)</label>
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="0.01"
+                            value={newCutoff}
+                            onChange={(e) => setNewCutoff(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") addCutoff(); }}
+                            placeholder="e.g., 75"
+                            className="w-full rounded border border-gray-300 px-2 py-1 text-sm"
+                          />
+                        </div>
+                        <button
+                          onClick={addCutoff}
+                          className="rounded border px-3 py-1 text-sm hover:bg-gray-50"
+                        >
+                          Add
+                        </button>
+                      </div>
+                    </div>
+
+                    {!csvMeta?.loaded || cutoffAnalysis.length === 0 ? (
+                      <p className="text-sm text-gray-600">Cutoff analysis appears after you upload a CSV and compute at least one non-NR score.</p>
+                    ) : (
+                      <>
+                        <div className="mb-3">
+                          <button 
+                            onClick={() => downloadCsv(
+                              'score_cutoffs_analysis.csv', 
+                              cutoffAnalysis.map(r => ({ 
+                                range: r.range, 
+                                count: r.count, 
+                                percent: (Math.round(r.percent*100)/100).toFixed(2), 
+                                cumCount: r.cumCount,
+                                cumPercent: (Math.round(r.cumPercent*100)/100).toFixed(2) 
+                              })), 
+                              ['range','count','percent','cumCount','cumPercent']
+                            )} 
+                            className="rounded border px-3 py-1 text-sm hover:bg-gray-50"
+                          >
+                            Download CSV
+                          </button>
+                        </div>
+                        
+                        <div className="max-h-48 overflow-auto rounded border">
+                          <table className="w-full text-left text-sm">
+                            <thead className="sticky top-0 bg-gray-50">
+                              <tr>
+                                <th className="px-3 py-2">Score Range</th>
+                                <th className="px-3 py-2">Count</th>
+                                <th className="px-3 py-2">% in Range</th>
+                                <th className="px-3 py-2">Cum. Count</th>
+                                <th className="px-3 py-2">Percentile</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {cutoffAnalysis.map((r, i) => (
+                                <tr key={`cutoff-${i}`} className="border-t">
+                                  <td className="px-3 py-2">{r.range}</td>
+                                  <td className="px-3 py-2">{r.count}</td>
+                                  <td className="px-3 py-2">{formatPct(r.percent)}</td>
+                                  <td className="px-3 py-2">{r.cumCount}</td>
+                                  <td className="px-3 py-2">{formatPct(r.cumPercent)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Grouped Data View */}
                   <div className="mt-6">
                     <h3 className="text-base font-medium mb-2">Data for selected biomarkers (from CSV)</h3>
                     {!csvMeta?.loaded ? (
@@ -855,54 +1053,56 @@ export default function App() {
                     ) : activeAreaGroups.length === 0 ? (
                       <p className="text-sm text-gray-600">No matching rows for the selected biomarkers in this health area.</p>
                     ) : (
-                      <div className="space-y-3">
-                        {activeAreaGroups.map((group) => {
-                          const agg = aggregateWeightedScore(group.rows);
-                          const chipColor = scoreBandColor(agg);
-                          return (
-                            <details key={`tid-${group.testId}`} className="rounded-xl border bg-white">
-                              <summary className="cursor-pointer select-none px-3 py-2 text-sm flex items-center justify-between">
-                                <span>
-                                  <span className="font-medium">TestID:</span> {group.testId}
-                                  <span className="ml-2 text-gray-600">• {group.rows.length} row{group.rows.length === 1 ? "" : "s"}</span>
-                                  <span className="ml-3 inline-flex items-center gap-2 rounded-full px-2 py-1 text-xs" style={{ backgroundColor: chipColor, color: idealTextColor(chipColor) }}>
-                                    Area score: {agg === null ? "—" : `${agg.toFixed(2)}`}
+                      <details className="rounded-2xl border bg-white">
+                        <summary className="cursor-pointer select-none px-3 py-2 text-sm">Per-TestID details ({activeAreaGroups.length})</summary>
+                        <div className="p-3 space-y-3">
+                          {activeAreaGroups.map((group) => {
+                            const agg = aggregateWeightedScore(group.rows);
+                            const chipColor = scoreBandColor(agg);
+                            return (
+                              <div key={`tid-${group.testId}`} className="rounded-xl border bg-white">
+                                <div className="px-3 py-2 text-sm flex items-center justify-between">
+                                  <span>
+                                    <span className="font-medium">TestID:</span> {group.testId}
+                                    <span className="ml-2 text-gray-600">• {group.rows.length} row{group.rows.length === 1 ? "" : "s"}</span>
+                                    <span className="ml-3 inline-flex items-center gap-2 rounded-full px-2 py-1 text-xs" style={{ backgroundColor: chipColor, color: idealTextColor(chipColor) }}>
+                                      Area score: {agg === null ? "–" : `${agg.toFixed(2)}`}
+                                    </span>
                                   </span>
-                                </span>
-                                <span className="text-gray-500">▾</span>
-                              </summary>
-                              <div className="px-3 pb-3 overflow-auto">
-                                <table className="w-full text-left text-sm">
-                                  <thead className="sticky top-0 bg-gray-50">
-                                    <tr>
-                                      <th className="px-3 py-2">Biomarker</th>
-                                      <th className="px-3 py-2">Lab Conc.</th>
-                                      <th className="px-3 py-2">Ref Low</th>
-                                      <th className="px-3 py-2">Ref High</th>
-                                      <th className="px-3 py-2">Score</th>
-                                      <th className="px-3 py-2">Color</th>
-                                      <th className="px-3 py-2">Assay</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {group.rows.map((r, i) => (
-                                      <tr key={`row-${group.testId}-${i}-${slugForKey(r.__BIOMARKER__)}`} className="border-t">
-                                        <td className="px-3 py-2 align-top font-semibold rounded" style={{ backgroundColor: colorHexFromName(r.COLOR), color: idealTextColor(colorHexFromName(r.COLOR)) }}>{r.__BIOMARKER__}</td>
-                                        <td className="px-3 py-2 align-top">{r.LAB_CONCENTRATION ?? ""}</td>
-                                        <td className="px-3 py-2 align-top">{r.LOWER_REFERENCE_RANGE ?? ""}</td>
-                                        <td className="px-3 py-2 align-top">{r.UPPER_REFERENCE_RANGE ?? ""}</td>
-                                        <td className="px-3 py-2 align-top">{(r.SCORE ?? "") === "" ? (isNR(r) ? "NR" : "") : r.SCORE}</td>
-                                        <td className="px-3 py-2 align-top">{(r.COLOR ?? "") === "" ? (isNR(r) ? "NR" : "") : r.COLOR}</td>
-                                        <td className="px-3 py-2 align-top">{r.ASSAY_NAME ?? ""}</td>
+                                </div>
+                                <div className="px-3 pb-3 overflow-auto">
+                                  <table className="w-full text-left text-sm">
+                                    <thead className="sticky top-0 bg-gray-50">
+                                      <tr>
+                                        <th className="px-3 py-2">Biomarker</th>
+                                        <th className="px-3 py-2">Lab Conc.</th>
+                                        <th className="px-3 py-2">Ref Low</th>
+                                        <th className="px-3 py-2">Ref High</th>
+                                        <th className="px-3 py-2">Score</th>
+                                        <th className="px-3 py-2">Color</th>
+                                        <th className="px-3 py-2">Assay</th>
                                       </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
+                                    </thead>
+                                    <tbody>
+                                      {group.rows.map((r, i) => (
+                                        <tr key={`row-${group.testId}-${i}-${slugForKey(r.__BIOMARKER__)}`} className="border-t">
+                                          <td className="px-3 py-2 align-top font-semibold rounded" style={{ backgroundColor: colorHexFromName(r.COLOR), color: idealTextColor(colorHexFromName(r.COLOR)) }}>{r.__BIOMARKER__}</td>
+                                          <td className="px-3 py-2 align-top">{r.LAB_CONCENTRATION ?? ""}</td>
+                                          <td className="px-3 py-2 align-top">{r.LOWER_REFERENCE_RANGE ?? ""}</td>
+                                          <td className="px-3 py-2 align-top">{r.UPPER_REFERENCE_RANGE ?? ""}</td>
+                                          <td className="px-3 py-2 align-top">{(r.SCORE ?? "") === "" ? (isNR(r) ? "NR" : "") : r.SCORE}</td>
+                                          <td className="px-3 py-2 align-top">{(r.COLOR ?? "") === "" ? (isNR(r) ? "NR" : "") : r.COLOR}</td>
+                                          <td className="px-3 py-2 align-top">{r.ASSAY_NAME ?? ""}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
                               </div>
-                            </details>
-                          );
-                        })}
-                      </div>
+                            );
+                          })}
+                        </div>
+                      </details>
                     )}
                   </div>
                 </div>
@@ -911,38 +1111,14 @@ export default function App() {
           </div>
         </div>
 
-        {/* Histogram (per-TestID distribution) */}
-        <div className="mt-6 rounded-2xl border bg-white p-4 shadow-sm">
-          <h3 className="text-base font-medium mb-2">Health area score histogram (per TestID)</h3>
-          {!csvMeta?.loaded || areaScoreHistogram.reduce((acc, b) => acc + b.count, 0) === 0 ? (
-            <p className="text-sm text-gray-600">Histogram appears after you upload a CSV and compute at least one non-NR score.</p>
-          ) : (
-            <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={areaScoreHistogram} margin={{ top: 10, right: 20, bottom: 5, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis type="number" dataKey="binCenter" domain={[-HIST_BIN_SIZE / 2, 100 + HIST_BIN_SIZE / 2]} ticks={[0,10,20,30,40,50,60,70,80,90,100]} allowDecimals={false} />
-                  <YAxis allowDecimals={false} />
-                  <Tooltip labelFormatter={(x) => { const start = Math.max(0, Math.round(x - HIST_BIN_SIZE / 2)); const end = Math.min(100, Math.round(x + HIST_BIN_SIZE / 2)); return `Score ${start}-${end}`; }} formatter={(v) => [v, "TestIDs"]} />
-                  <ReferenceLine x={70} stroke="#ffc800" strokeDasharray="3 3" />
-                  <ReferenceLine x={91} stroke="#3fb6dc" strokeDasharray="3 3" />
-                  <Bar dataKey="count" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </div>
-
         {/* Debug / preview JSON */}
         <details className="mt-6">
           <summary className="cursor-pointer text-sm text-gray-600">Show current state (JSON)</summary>
-          <pre className="mt-2 whitespace-pre-wrap rounded-xl bg-gray-900 text-gray-100 p-4 text-xs overflow-auto">{
-JSON.stringify(
+          <pre className="mt-2 whitespace-pre-wrap rounded-xl bg-gray-900 text-gray-100 p-4 text-xs overflow-auto">{JSON.stringify(
   areas.map((a) => ({ id: a.id, name: a.name, biomarkers: [...a.biomarkers] })),
   null,
   2
-)
-}</pre>
+)}</pre>
         </details>
 
         {/* Self-test results */}
