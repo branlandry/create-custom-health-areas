@@ -1,5 +1,5 @@
-// postcss.config.js (project root)
-module.exports = {
+// postcss.config.js  (ESM)
+export default {
   plugins: {
     '@tailwindcss/postcss': {},
   },
